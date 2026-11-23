@@ -1,196 +1,141 @@
-// A tiny stack VM for make.fun's tiny stack ISA (ISA.md).
-import { mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+// A tiny stack virtual machine for make.fun's tiny-stack-vm-01, written from ISA.md.
+// Node 22 runs it directly: no dependencies, no build step, no type annotations.
+const fs = require("node:fs");
+const path = require("node:path");
 
-const STEP_LIMIT = 1000000;
-const OUT_MAX = 65536;
-
-// opcode: immediate bytes, pops, pushes
-const T = '00,0,0,0;01,1,0,1;02,4,0,1;03,0,1,0;04,0,1,2;05,0,2,2;06,0,2,3;07,0,3,3;' +
-  '10,0,2,1;11,0,2,1;12,0,2,1;13,0,2,1;14,0,2,1;15,0,2,1;16,0,2,1;17,0,1,1;' +
-  '18,0,2,1;19,0,2,1;1a,0,2,1;1b,0,1,1;1c,0,2,1;1d,0,2,1;1e,0,2,1;20,0,2,1;' +
-  '21,0,2,1;22,0,2,1;30,2,0,0;31,2,1,0;32,2,1,0;33,2,0,0;34,0,0,0;40,0,1,1;' +
-  '41,0,2,0;50,0,1,0;51,0,1,0;52,0,0,1;53,0,1,0';
-
-const IMM = new Uint8Array(256);
-const POPS = new Uint8Array(256);
-const PUSHES = new Uint8Array(256);
-const KNOWN = new Uint8Array(256);
-for (const row of T.split(';')) {
-  const f = row.split(',');
-  const c = parseInt(f[0], 16);
-  IMM[c] = +f[1];
-  POPS[c] = +f[2];
-  PUSHES[c] = +f[3];
-  KNOWN[c] = 1;
+const dirIn = process.env.MAKEFUN_INPUT_DIR;
+const dirOut = process.env.MAKEFUN_OUTPUT_DIR;
+const prog = fs.readFileSync(path.join(dirIn, "program.bin"));
+let input = Buffer.alloc(0);
+try {
+  input = fs.readFileSync(path.join(dirIn, "input.bin"));
+} catch (e) {
+  input = Buffer.alloc(0);
 }
 
-const stack = new Int32Array(256);
-const calls = new Int32Array(64);
-const memory = new Int32Array(256);
-const out = Buffer.allocUnsafe(OUT_MAX);
-const digits = Buffer.allocUnsafe(12);
+// Per opcode: [values popped, values pushed, immediate bytes]. Absent = unknown opcode.
+const T = [];
+const op = (c, pops, pushes, imm) => { T[c] = [pops, pushes, imm || 0]; };
+op(0x00, 0, 0); op(0x01, 0, 1, 1); op(0x02, 0, 1, 4);
+op(0x03, 1, 0); op(0x04, 1, 2); op(0x05, 2, 2); op(0x06, 2, 3); op(0x07, 3, 3);
+for (let c = 0x10; c <= 0x16; c++) op(c, 2, 1);
+op(0x17, 1, 1); op(0x18, 2, 1); op(0x19, 2, 1); op(0x1a, 2, 1); op(0x1b, 1, 1);
+op(0x1c, 2, 1); op(0x1d, 2, 1); op(0x1e, 2, 1);
+op(0x20, 2, 1); op(0x21, 2, 1); op(0x22, 2, 1);
+op(0x30, 0, 0, 2); op(0x31, 1, 0, 2); op(0x32, 1, 0, 2); op(0x33, 0, 0, 2); op(0x34, 0, 0);
+op(0x40, 1, 1); op(0x41, 2, 0); op(0x50, 1, 0); op(0x51, 1, 0); op(0x52, 0, 1); op(0x53, 1, 0);
 
-function run(program: Uint8Array, input: Uint8Array): [number, number] {
-  let pc = 0;
-  let sp = 0;
-  let cp = 0;
-  let ip = 0;
-  let outLen = 0;
-  let steps = 0;
-  let code = -1;
-  const n = program.length;
-  stack.fill(0);
-  memory.fill(0);
-  while (code < 0) {
-    if (steps === STEP_LIMIT) code = 10;
-    else if (pc < 0 || pc >= n) code = 9;
-    else if (KNOWN[program[pc]] === 0) code = 5;
-    else {
-      const o = program[pc];
-      const next = pc + 1 + IMM[o];
-      const pops = POPS[o];
-      const pushes = PUSHES[o];
-      if (next > n) code = 9;
-      else if (sp < pops) code = 2;
-      else if (sp - pops + pushes > 256) code = 3;
-      else {
-        let a = 0;
-        let b = 0;
-        if (pops === 1) a = stack[sp - 1];
-        else if (pops === 2) {
-          b = stack[sp - 1];
-          a = stack[sp - 2];
-        } else if (pops === 3) {
-          const c = stack[sp - 1];
-          b = stack[sp - 2];
-          a = stack[sp - 3];
-          stack[sp - 3] = b;
-          stack[sp - 2] = c;
-          stack[sp - 1] = a;
-        }
-        sp -= pops;
-        let jump = -1;
-        switch (o) {
-          case 0x00: code = 0; break;
-          case 0x01: stack[sp++] = (program[pc + 1] << 24) >> 24; break;
-          case 0x02: stack[sp++] = program[pc + 1] | (program[pc + 2] << 8) | (program[pc + 3] << 16) | (program[pc + 4] << 24); break;
-          case 0x03: break;
-          case 0x04: stack[sp++] = a; stack[sp++] = a; break;
-          case 0x05: stack[sp++] = b; stack[sp++] = a; break;
-          case 0x06: stack[sp++] = a; stack[sp++] = b; stack[sp++] = a; break;
-          case 0x07: sp += 3; break;
-          case 0x10: stack[sp++] = (a + b) | 0; break;
-          case 0x11: stack[sp++] = (a - b) | 0; break;
-          case 0x12: stack[sp++] = Math.imul(a, b); break;
-          case 0x13:
-            if (b === 0) code = 4;
-            else if (a === -2147483648 && b === -1) stack[sp++] = a;
-            else stack[sp++] = (a / b) | 0;
-            break;
-          case 0x14:
-            if (b === 0) code = 4;
-            else stack[sp++] = b === -1 ? 0 : (a % b) | 0;
-            break;
-          case 0x15:
-            if (b === 0) code = 4;
-            else stack[sp++] = ((a >>> 0) / (b >>> 0)) | 0;
-            break;
-          case 0x16:
-            if (b === 0) code = 4;
-            else stack[sp++] = ((a >>> 0) % (b >>> 0)) | 0;
-            break;
-          case 0x17: stack[sp++] = (-a) | 0; break;
-          case 0x18: stack[sp++] = a & b; break;
-          case 0x19: stack[sp++] = a | b; break;
-          case 0x1a: stack[sp++] = a ^ b; break;
-          case 0x1b: stack[sp++] = ~a; break;
-          case 0x1c: stack[sp++] = a << (b & 31); break;
-          case 0x1d: stack[sp++] = a >> (b & 31); break;
-          case 0x1e: stack[sp++] = (a >>> (b & 31)) | 0; break;
-          case 0x20: stack[sp++] = a === b ? 1 : 0; break;
-          case 0x21: stack[sp++] = a < b ? 1 : 0; break;
-          case 0x22: stack[sp++] = (a >>> 0) < (b >>> 0) ? 1 : 0; break;
-          case 0x30:
-          case 0x31:
-          case 0x32:
-            if (o === 0x30 || (o === 0x31 ? a === 0 : a !== 0)) {
-              jump = next + (((program[pc + 1] | (program[pc + 2] << 8)) << 16) >> 16);
-            } else jump = next;
-            break;
-          case 0x33:
-            if (cp === 64) code = 7;
-            else {
-              calls[cp++] = next;
-              jump = program[pc + 1] | (program[pc + 2] << 8);
-            }
-            break;
-          case 0x34:
-            if (cp === 0) code = 8;
-            else jump = calls[--cp];
-            break;
-          case 0x40:
-            if (a < 0 || a > 255) code = 6;
-            else stack[sp++] = memory[a];
-            break;
-          case 0x41:
-            if (b < 0 || b > 255) code = 6;
-            else memory[b] = a;
-            break;
-          case 0x50: {
-            const neg = a < 0;
-            let v = neg ? (a === -2147483648 ? 2147483648 : -a) : a;
-            let len = 0;
-            do {
-              digits[len++] = 48 + (v % 10);
-              v = Math.floor(v / 10);
-            } while (v > 0);
-            if (neg) digits[len++] = 45;
-            if (outLen + len > OUT_MAX) {
-              code = 11;
-              break;
-            }
-            for (let i = 0; i < len; i++) out[outLen + i] = digits[len - 1 - i];
-            outLen += len;
-            break;
-          }
-          case 0x51:
-            if (outLen === OUT_MAX) code = 11;
-            else out[outLen++] = a & 255;
-            break;
-          case 0x52: stack[sp++] = ip < input.length ? input[ip++] : -1; break;
-          case 0x53: code = a & 255; break;
-        }
-        if (code < 0) {
-          steps++;
-          pc = jump < 0 ? next : jump;
-        }
-      }
+const stack = new Int32Array(256); // data stack, values are 32-bit two's complement
+const calls = new Int32Array(64); // return addresses
+const memory = new Int32Array(256); // 256 words, all zero
+const out = []; // output bytes, at most 65536
+let sp = 0, cp = 0, ip = 0, pc = 0, steps = 0, res = 0;
+
+run: while (true) {
+  if (steps >= 1000000) { res = 10; break; } // step limit
+  if (pc < 0 || pc >= prog.length) { res = 9; break; } // pc outside the program
+  const opc = prog[pc];
+  const meta = T[opc];
+  if (meta === undefined) { res = 5; break; } // unknown opcode
+  const immLen = meta[2];
+  if (pc + 1 + immLen > prog.length) { res = 9; break; } // immediate cut off
+  if (sp < meta[0]) { res = 2; break; } // stack underflow
+  if (sp - meta[0] + meta[1] > 256) { res = 3; break; } // stack overflow
+
+  const nx = pc + 1 + immLen; // the address after this instruction
+  const b1 = immLen > 0 ? prog[pc + 1] : 0;
+  const w2 = immLen > 1 ? b1 | (prog[pc + 2] << 8) : 0;
+  const s8 = (b1 << 24) >> 24;
+  const s16 = (w2 << 16) >> 16;
+  const s32 = immLen > 3 ? w2 | (prog[pc + 3] << 16) | (prog[pc + 4] << 24) : 0;
+  steps++;
+  pc = nx;
+
+  switch (opc) {
+    case 0x00: res = 0; break run; // HALT
+    case 0x01: stack[sp++] = s8; break; // PUSH8, sign-extended
+    case 0x02: stack[sp++] = s32; break; // PUSH32
+    case 0x03: sp--; break; // POP
+    case 0x04: stack[sp] = stack[sp - 1]; sp++; break; // DUP
+    case 0x05: { const t = stack[sp - 1]; stack[sp - 1] = stack[sp - 2]; stack[sp - 2] = t; break; } // SWAP
+    case 0x06: stack[sp] = stack[sp - 2]; sp++; break; // OVER
+    case 0x07: { // ROT: ( a b c -- b c a )
+      const t = stack[sp - 3];
+      stack[sp - 3] = stack[sp - 2];
+      stack[sp - 2] = stack[sp - 1];
+      stack[sp - 1] = t;
+      break;
     }
+    case 0x10: stack[sp - 2] = (stack[sp - 2] + stack[sp - 1]) | 0; sp--; break; // ADD
+    case 0x11: stack[sp - 2] = (stack[sp - 2] - stack[sp - 1]) | 0; sp--; break; // SUB
+    case 0x12: stack[sp - 2] = Math.imul(stack[sp - 2], stack[sp - 1]); sp--; break; // MUL
+    case 0x13: case 0x14: { // DIV, MOD: signed, truncated toward zero
+      const a = stack[sp - 2], b = stack[sp - 1];
+      if (b === 0) { res = 4; break run; }
+      stack[sp - 2] = opc === 0x13 ? (a / b) | 0 : (a % b) | 0;
+      sp--;
+      break;
+    }
+    case 0x15: case 0x16: { // DIVU, MODU: both operands unsigned, result read back as signed
+      const a = stack[sp - 2] >>> 0, b = stack[sp - 1] >>> 0;
+      if (b === 0) { res = 4; break run; }
+      stack[sp - 2] = opc === 0x15 ? (a / b) | 0 : (a % b) | 0;
+      sp--;
+      break;
+    }
+    case 0x17: stack[sp - 1] = -stack[sp - 1] | 0; break; // NEG
+    case 0x18: stack[sp - 2] = stack[sp - 2] & stack[sp - 1]; sp--; break; // AND
+    case 0x19: stack[sp - 2] = stack[sp - 2] | stack[sp - 1]; sp--; break; // OR
+    case 0x1a: stack[sp - 2] = stack[sp - 2] ^ stack[sp - 1]; sp--; break; // XOR
+    case 0x1b: stack[sp - 1] = ~stack[sp - 1]; break; // NOT
+    case 0x1c: stack[sp - 2] = stack[sp - 2] << (stack[sp - 1] & 31); sp--; break; // SHL
+    case 0x1d: stack[sp - 2] = stack[sp - 2] >> (stack[sp - 1] & 31); sp--; break; // SHR, arithmetic
+    case 0x1e: stack[sp - 2] = (stack[sp - 2] >>> (stack[sp - 1] & 31)) | 0; sp--; break; // SHRU, logical
+    case 0x20: stack[sp - 2] = stack[sp - 2] === stack[sp - 1] ? 1 : 0; sp--; break; // EQ
+    case 0x21: stack[sp - 2] = stack[sp - 2] < stack[sp - 1] ? 1 : 0; sp--; break; // LT, signed
+    case 0x22: stack[sp - 2] = (stack[sp - 2] >>> 0) < (stack[sp - 1] >>> 0) ? 1 : 0; sp--; break; // LTU
+    case 0x30: pc = nx + s16; break; // JMP
+    case 0x31: if (stack[--sp] === 0) pc = nx + s16; break; // JZ
+    case 0x32: if (stack[--sp] !== 0) pc = nx + s16; break; // JNZ
+    case 0x33: // CALL
+      if (cp >= 64) { res = 7; break run; }
+      calls[cp++] = nx;
+      pc = w2;
+      break;
+    case 0x34: // RET
+      if (cp === 0) { res = 8; break run; }
+      pc = calls[--cp];
+      break;
+    case 0x40: { // LOAD
+      const addr = stack[sp - 1];
+      if (addr < 0 || addr > 255) { res = 6; break run; }
+      stack[sp - 1] = memory[addr];
+      break;
+    }
+    case 0x41: { // STORE: ( v addr -- )
+      const addr = stack[sp - 1];
+      if (addr < 0 || addr > 255) { res = 6; break run; }
+      memory[addr] = stack[sp - 2];
+      sp -= 2;
+      break;
+    }
+    case 0x50: { // PRINT, decimal ASCII
+      const text = String(stack[--sp]);
+      if (out.length + text.length > 65536) { res = 11; break run; }
+      for (let i = 0; i < text.length; i++) out.push(text.charCodeAt(i));
+      break;
+    }
+    case 0x51: { // PUTC
+      const v = stack[--sp] & 255;
+      if (out.length >= 65536) { res = 11; break run; }
+      out.push(v);
+      break;
+    }
+    case 0x52: stack[sp++] = ip < input.length ? input[ip++] : -1; break; // IN
+    case 0x53: res = stack[--sp] & 255; break run; // EXIT
   }
-  return [code, outLen];
 }
 
-const inputRoot = process.env.MAKEFUN_INPUT_DIR ?? '/input';
-const outputRoot = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
-
-for (const id of readdirSync(inputRoot).sort()) {
-  const dir = join(inputRoot, id);
-  let program: Uint8Array;
-  try {
-    program = readFileSync(join(dir, 'program.bin'));
-  } catch {
-    continue;
-  }
-  let input: Uint8Array;
-  try {
-    input = readFileSync(join(dir, 'input.bin'));
-  } catch {
-    input = new Uint8Array(0);
-  }
-  const [code, len] = run(program, input);
-  const dest = join(outputRoot, id);
-  mkdirSync(dest, { recursive: true });
-  writeFileSync(join(dest, 'stdout.bin'), out.subarray(0, len));
-  writeFileSync(join(dest, 'exit.txt'), String(code) + '\n');
-}
+fs.mkdirSync(dirOut, { recursive: true });
+fs.writeFileSync(path.join(dirOut, "stdout.bin"), Buffer.from(out));
+fs.writeFileSync(path.join(dirOut, "exit.txt"), String(res) + "\n");
